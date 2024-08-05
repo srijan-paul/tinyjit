@@ -2,4 +2,4 @@ zig-cache
 zig-out
 build
 out
-
+tmp

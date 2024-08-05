@@ -1,77 +1,97 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const interp = @import("interpreter.zig");
 
-const Opcode = enum(u8) {
-    load_const,
-    add,
-    print,
-    exit,
-};
+const CodeBlock = interp.CodeBlock;
+const Interpreter = interp.Interpreter;
+const Op = interp.Op;
 
-const Interpreter = struct {
-    stack: [32_000]i64 = undefined,
-    stack_pos: u64 = 0,
+fn runProgram(allocator: std.mem.Allocator, program: []const CodeBlock, jit: bool) !void {
+    var interpreter = try Interpreter.init(allocator, program);
+    interpreter.is_jit_enabled = jit;
 
-    instructions: []const u8,
-    pc: usize = 0,
-
-    constants: []const i64,
-
-    inline fn loadConst(self: *Interpreter) i64 {
-        const index = self.instructions[self.pc];
-        const constant = self.constants[index];
-
-        self.pc += 1;
-        return constant;
+    defer {
+        interpreter.deinit();
+        allocator.destroy(interpreter);
     }
 
-    inline fn pop(self: *Interpreter) i64 {
-        self.stack_pos -= 1;
-        return self.stack[self.stack_pos];
-    }
-
-    inline fn push(self: *Interpreter, value: i64) void {
-        self.stack[self.stack_pos] = value;
-        self.stack_pos += 1;
-    }
-
-    pub fn run(self: *Interpreter) !void {
-        while (self.pc < self.instructions.len) {
-            const instr: Opcode = @enumFromInt(self.instructions[self.pc]);
-            self.pc += 1;
-
-            switch (instr) {
-                .load_const => self.push(self.loadConst()),
-                .add => {
-                    const a = self.pop();
-                    const b = self.pop();
-                    self.push(a + b);
-                },
-                .print => std.debug.print("{d}\n", .{self.pop()}),
-                .exit => {
-                    const exit_code: u8 = @intCast(self.pop());
-                    std.process.exit(exit_code);
-                },
-            }
-        }
-    }
-};
-
-pub inline fn Op(o: Opcode) u8 {
-    return @intFromEnum(o);
+    try interpreter.run();
 }
 
 pub fn main() !void {
-    var interpreter = Interpreter{
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    // 0 is x, 1 is i
+    const b0 = CodeBlock{
         .instructions = &[_]u8{
-            Op(.load_const), 0, // load 42
-            Op(.load_const), 1, // load 24
-            Op(.add), // 42 + 24 = 66
-            Op(.print), // print(66)
-            Op(.load_const), 2, // load 0
-            Op(.exit), // exit()
+            Op(.push), 0, // x = 0
+            Op(.push), 0, // i = 0
+            Op(.jump), 1, // jump to while loop (block 1
         },
-        .constants = &[_]i64{ 42, 24, 0 },
+
+        .constants = &[_]i64{0},
     };
 
-    try interpreter.run();
+    const b1 = CodeBlock{
+        .instructions = &[_]u8{
+            // while i < 1_000_000
+            Op(.load_var), 1, // load i
+            Op(.push), 0, // load 1_000_000
+            Op(.eq),
+            Op(.jump_nz), 2, // jump to exit if i == 1_000_000
+
+            // x = x + 1
+            Op(.load_var), 0, // load x
+            Op(.load_var), 1, // load i
+            Op(.add),
+            Op(.store_var), 0, // x = x + i
+
+            // i += 1
+            Op(.load_var), 1, // load i
+            Op(.push), 1, // load 1
+            Op(.add),
+            Op(.store_var), 1, // i = i + 1
+            Op(.jump), 1, // jump to start
+        },
+        .constants = &[_]i64{ 5_000_000, 1 },
+    };
+
+    const b2 = CodeBlock{
+        .instructions = &[_]u8{
+            Op(.load_var), 0, // load x
+            // Op(.print),
+        },
+        .constants = &[_]i64{0},
+    };
+
+    const program = [_]CodeBlock{ b0, b1, b2 };
+
+    var is_jit_enabled = false;
+    if (std.os.argv.len > 0) {
+        const arg = std.os.argv[std.os.argv.len - 1];
+        var len: usize = 0;
+        while (arg[len] != 0) len += 1;
+
+        const jit_flag = "--jit";
+        is_jit_enabled = std.mem.eql(u8, arg[0..len], jit_flag);
+    }
+
+    const n_runs = 100;
+    const before = std.time.milliTimestamp();
+    for (0..n_runs) |_| {
+        try runProgram(allocator, &program, is_jit_enabled);
+    }
+    const after = std.time.milliTimestamp();
+
+    const dt: f64 = @floatFromInt(after - before);
+    const avg_time = dt / @as(f64, @floatFromInt(n_runs));
+
+    const msg = try std.fmt.allocPrintZ(allocator, "Time per run: {d} ms\n", .{avg_time});
+    defer allocator.free(msg);
+
+    const stdout = std.io.getStdOut();
+    defer stdout.close();
+
+    _ = try stdout.write(msg);
 }
