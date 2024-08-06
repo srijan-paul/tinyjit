@@ -1,11 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const mman = @cImport(@cInclude("sys/mman.h"));
+const pthread = @cImport(@cInclude("pthread.h"));
 
 const Opcode = enum(u8) {
     push,
     add,
     print,
     exit,
-    eq, // pushes 1 if stack[-1] == stack[-2], 0 otherwise
+    eq,
     jumpif_1,
     jump,
     load_var,
@@ -17,6 +20,94 @@ const CodeBlock = struct {
     constants: []const i64,
 };
 
+const Armv8a = struct {
+    const Ret: u32 = 0xd65f03c0;
+    const Mov42X0: u32 = 0xd2800540;
+};
+
+const IntFn = *fn () callconv(.C) u32;
+
+const JITCompiler = struct {
+    allocator: std.mem.Allocator,
+
+    interpreter: *const Interpreter,
+    codeBuf: std.ArrayList(u32),
+    current_block: *const CodeBlock = undefined,
+
+    pub fn init(allocator: std.mem.Allocator, interpreter: *Interpreter) JITCompiler {
+        return .{
+            .allocator = allocator,
+            .interpreter = interpreter,
+            .codeBuf = std.ArrayList(u32).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *JITCompiler) void {
+        self.codeBuf.deinit();
+    }
+
+    fn allocJitBuf(size: usize) [*]u32 {
+        const buf: *anyopaque = mman.mmap(
+            null,
+            size,
+            mman.PROT_WRITE | mman.PROT_EXEC,
+            mman.MAP_PRIVATE | mman.MAP_ANONYMOUS | mman.MAP_JIT,
+            -1,
+            0,
+        ) orelse unreachable; // TODO: return error
+
+        if (buf == mman.MAP_FAILED) {
+            std.debug.panic("mmap failed\n", .{}); // return error
+        }
+
+        return @ptrCast(@alignCast(buf));
+    }
+
+    fn deallocJitBuf(buf: *i32, size: usize) void {
+        if (mman.munmap(buf, size) != 0) {
+            std.debug.panic("munmap failed\n", .{});
+        }
+    }
+
+    pub fn compileBlock(self: *JITCompiler, block: *const CodeBlock) void {
+        self.current_block = block;
+
+        var jitbuf = allocJitBuf(2);
+        defer deallocJitBuf(jitbuf, 2);
+
+        pthread.pthread_jit_write_protect_np(0);
+        jitbuf[0] = Armv8a.Mov42X0;
+        jitbuf[1] = Armv8a.Ret;
+        pthread.pthread_jit_write_protect_np(1);
+
+        const func: IntFn = @ptrCast(jitbuf);
+        const ec = func();
+
+        std.process.exit(@truncate(ec));
+
+        // for (block.instructions) |instr| {
+        //     const op: Opcode = @enumFromInt(instr);
+        //     switch (op) {
+        //         .push => self.compilePush(),
+        //         else => std.debug.panic("Not implemented\n", .{}),
+        //     }
+        // }
+    }
+
+    // X0 = pointer to the stack (*i64)
+    // X1 = pointer to the stack_pos (*u64)
+    // X2 = pointer to the instructions (*u8)
+    // X3 = pointer to the constants (*i64)
+    // X4 = pointer to the pc (*usize)
+    fn compileLoadConst(self: *JITCompiler) void {
+        _ = self;
+    }
+
+    fn compilePush(self: *JITCompiler) void {
+        _ = self;
+    }
+};
+
 const Interpreter = struct {
     stack: [32_000]i64 = undefined,
     stack_pos: u64 = 0,
@@ -24,13 +115,23 @@ const Interpreter = struct {
     blocks: []const CodeBlock,
     current_block: *const CodeBlock = undefined,
 
+    jit_compiler: JITCompiler,
+
     pc: usize = 0,
 
-    pub fn init(blocks: []const CodeBlock) Interpreter {
-        return .{
+    pub fn init(allocator: std.mem.Allocator, blocks: []const CodeBlock) !*Interpreter {
+        const self = try allocator.create(Interpreter);
+        self.* = Interpreter{
             .blocks = blocks,
             .current_block = &blocks[0],
+            .jit_compiler = JITCompiler.init(allocator, self),
         };
+
+        return self;
+    }
+
+    fn deinit(self: *Interpreter) void {
+        self.jit_compiler.deinit();
     }
 
     inline fn loadConst(self: *Interpreter) i64 {
@@ -62,6 +163,8 @@ const Interpreter = struct {
     }
 
     pub fn run(self: *Interpreter) !void {
+        self.jit_compiler.compileBlock(&self.blocks[1]);
+
         while (self.pc < self.current_block.instructions.len) {
             const instr: Opcode = @enumFromInt(self.nextOp());
 
@@ -108,7 +211,6 @@ const Interpreter = struct {
 
     fn jump(self: *Interpreter) void {
         const block_idx = self.nextOp();
-
         self.current_block = &self.blocks[block_idx];
         self.pc = 0;
     }
@@ -119,6 +221,9 @@ pub inline fn Op(o: Opcode) u8 {
 }
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
     // 0 is x, 1 is i
     const b0 = CodeBlock{
         .instructions = &[_]u8{
@@ -166,6 +271,11 @@ pub fn main() !void {
 
     const program = [_]CodeBlock{ b0, b1, b2 };
 
-    var interpreter = Interpreter.init(&program);
+    var interpreter = try Interpreter.init(allocator, &program);
+    defer {
+        interpreter.deinit();
+        allocator.destroy(interpreter);
+    }
+
     try interpreter.run();
 }
