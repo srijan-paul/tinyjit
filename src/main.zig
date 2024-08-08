@@ -42,16 +42,16 @@ const Armv8a = struct {
     }
 
     pub inline fn ldrRegUnscaled(dst_reg: Reg, base_reg: Reg, offset_reg: Reg) u32 {
-        const dst: u32 = @intFromEnum(dst_reg);
-        const base: u32 = @intFromEnum(base_reg);
-        const off: u32 = @intFromEnum(offset_reg);
+        const dst = @intFromEnum(dst_reg);
+        const base = @intFromEnum(base_reg);
+        const off = @intFromEnum(offset_reg);
         return 0xF8606800 | (off << 16) | (base << 5) | dst;
     }
 
     pub inline fn subRegImm(dst_reg: Reg, src_reg: Reg, imm: u32) u32 {
         std.debug.assert(imm <= 0b111111_111111);
-        const src: u32 = @intFromEnum(src_reg);
-        const dst: u32 = @intFromEnum(dst_reg);
+        const src = @intFromEnum(src_reg);
+        const dst = @intFromEnum(dst_reg);
 
         return 0xD1000000 | (imm << 10) | (src << 5) | dst;
     }
@@ -71,11 +71,19 @@ const Armv8a = struct {
         return 0x8b000000 | (b << 16) | (a << 5) | dst;
     }
 
-    pub inline fn strReg(dst_reg: Reg, src_reg: Reg, offset: u32) u32 {
-        const dst = @intFromEnum(dst_reg);
-        const src = @intFromEnum(src_reg);
+    pub inline fn strReg(src_reg: Reg, dst_reg: Reg, offset: u32) u32 {
+        const dst = @intFromEnum(src_reg);
+        const src = @intFromEnum(dst_reg);
         std.debug.assert(offset <= 0b111111_111111);
         return 0xF9000000 | (offset << 10) | (src << 5) | dst;
+    }
+
+    pub inline fn strRegScaled(src_reg: Reg, base_reg: Reg, offset_reg: Reg) u32 {
+        const src = @intFromEnum(src_reg);
+        const base = @intFromEnum(base_reg);
+        const offset = @intFromEnum(offset_reg);
+
+        return 0xF8207800 | (offset << 16) | (base << 5) | src;
     }
 
     pub inline fn mult8(dst_reg: Reg, src_reg: Reg) u32 {
@@ -92,7 +100,7 @@ test "ARMv8a code generation" {
     // ldr x9, [x0, x8, lsl #3]
     const ldr_scaled_offset = Armv8a.ldrRegScaled(.x9, .x0, .x8);
     try std.testing.expectEqual(0xf8687809, ldr_scaled_offset);
-    //	ldr x11, [x0, x10]
+    // ldr x11, [x0, x10]
     const ldr_unscaled_offset = Armv8a.ldrRegUnscaled(.x11, .x0, .x10);
     try std.testing.expectEqual(0xf86a680b, ldr_unscaled_offset);
     // add x12, x12, #1
@@ -105,19 +113,21 @@ test "ARMv8a code generation" {
     try std.testing.expectEqual(0xd37df10a, Armv8a.mult8(.x10, .x8));
     // add x9, x11, x9
     try std.testing.expectEqual(0x8b090169, Armv8a.addRegs(.x9, .x11, .x9));
+    // str x8, [x9, x10, lsl #3]
+    try std.testing.expectEqual(0xf82a7928, Armv8a.strRegScaled(.x8, .x9, .x10));
 }
 
 const JitFunction = *fn (
-    stack: *i64,
-    instructions: *u8,
-    stackPtr: *usize,
-    instrPtr: *usize,
+    stack: [*]i64,
+    instructions: [*]const u8,
+    stack_ptr: *usize,
+    instr_ptr: *usize,
     blocks: [*]const CodeBlock,
-    currentBlock: *const CodeBlock,
-) callconv(.C) u32;
+    current_block: *const CodeBlock,
+) callconv(.C) void;
 
 const CompiledFunction = struct {
-    func: JitFunction,
+    func: JitFunction, // both func and buf point to the same data.
     buf: [*]u32,
     size: usize,
 
@@ -130,10 +140,6 @@ const CompiledFunction = struct {
             std.debug.panic("munmap failed\n", .{});
         }
     }
-
-    pub inline fn call(self: *CompiledFunction) void {
-        self.func();
-    }
 };
 
 const JITCompiler = struct {
@@ -143,7 +149,7 @@ const JITCompiler = struct {
     machine_code: std.ArrayList(u32),
     current_block: *const CodeBlock = undefined,
 
-    const JitArgRegister = struct {
+    const ArgReg = struct {
         const stackAddr = .x0;
         const instructionsAddr = .x1;
         const stackPtr = .x2;
@@ -152,7 +158,7 @@ const JITCompiler = struct {
         const currentBlock = .x5;
     };
 
-    const JitVarRegister = struct {
+    const VarReg = struct {
         const stackPtr = .x8;
         const instrPtr = .x12;
         const tempA = .x9;
@@ -189,7 +195,7 @@ const JITCompiler = struct {
         return @ptrCast(@alignCast(buf));
     }
 
-    fn deallocJitBuf(buf: *i32, size: usize) void {
+    fn deallocJitBuf(buf: [*]u32, size: usize) void {
         if (mman.munmap(buf, size) != 0) {
             std.debug.panic("munmap failed\n", .{});
         }
@@ -199,86 +205,145 @@ const JITCompiler = struct {
     /// compile them into a function, then return the function.
     fn getCompiledFunction(self: *JITCompiler) CompiledFunction {
         const num_instructions = self.machine_code.items.len;
-        const bufsize = num_instructions * @sizeOf(u32);
+        const bufsize = num_instructions;
         const buf = allocJitBuf(bufsize);
-        defer deallocJitBuf(buf, bufsize);
 
         pthread.pthread_jit_write_protect_np(0);
         @memcpy(buf, self.machine_code.items);
         pthread.pthread_jit_write_protect_np(1);
 
         const func: JitFunction = @ptrCast(buf);
-
         return CompiledFunction.init(func, buf, bufsize);
     }
 
-    fn emit(self: *JITCompiler, instr: u32) void {
-        self.machine_code.append(instr);
+    inline fn emit(self: *JITCompiler, instr: u32) !void {
+        try self.machine_code.append(instr);
     }
 
-    fn emitPrelude(self: *JITCompiler) void {
+    fn emitPrelude(self: *JITCompiler) !void {
         // deref the stack pointer, store it in a local var
-        self.emit(Armv8a.ldrReg(JitVarRegister.stackPtr, JitArgRegister.stackPtr));
+        try self.emit(Armv8a.ldrReg(VarReg.stackPtr, ArgReg.stackPtr));
         // deref the instruction pointer, store it in a local var
-        self.emit(Armv8a.ldrReg(JitVarRegister.instrPtr, JitArgRegister.instrPtr));
+        try self.emit(Armv8a.ldrReg(VarReg.instrPtr, ArgReg.instrPtr));
     }
 
-    fn emitPop(self: *JITCompiler) void {
-        self.emit(Armv8a.subRegImm(
-            JitVarRegister.stackPtr,
-            JitVarRegister.stackPtr,
+    fn emitEpilogue(self: *JITCompiler) !void {
+        // Restore the stack and instruction pointers
+        try self.emit(Armv8a.strReg(VarReg.stackPtr, ArgReg.stackPtr, 0));
+        try self.emit(Armv8a.strReg(VarReg.instrPtr, ArgReg.instrPtr, 0));
+    }
+
+    fn emitPop(self: *JITCompiler) !void {
+        try self.emit(Armv8a.subRegImm(
+            VarReg.stackPtr,
+            VarReg.stackPtr,
             1,
         ));
     }
 
-    pub fn compileBlock(self: *JITCompiler, block: *const CodeBlock) void {
+    fn emitPushReg(self: *JITCompiler, reg: Armv8a.Reg) !void {
+        try self.emit(Armv8a.strRegScaled(
+            reg,
+            ArgReg.stackAddr,
+            VarReg.stackPtr,
+        ));
+
+        try self.emit(Armv8a.addRegImm(
+            VarReg.stackPtr,
+            VarReg.stackPtr,
+            1,
+        ));
+    }
+
+    fn emitReturn(self: *JITCompiler) !void {
+        try self.emitEpilogue();
+        try self.emit(Armv8a.ret);
+    }
+
+    pub fn compileBlock(self: *JITCompiler, block: *const CodeBlock) !CompiledFunction {
         self.current_block = block;
 
+        try self.emitPrelude();
         for (block.instructions) |instruction| {
             const op: Opcode = @enumFromInt(instruction);
 
-            // ip += 1; // TODO: increment instr pointer just once.
-            self.emit(Armv8a.addRegImm(JitArgRegister.instrPtr, 1));
+            // ip += 1; // TODO: increment instr pointer just once, for all instrs.
+            try self.emit(Armv8a.addRegImm(
+                ArgReg.instrPtr,
+                ArgReg.instrPtr,
+                1,
+            ));
 
             switch (op) {
                 .push => {},
                 .add => {
-                    self.emit(Armv8a.ldrRegScaled(
-                        JitVarRegister.tempA,
-                        JitArgRegister.stackAddr,
-                        JitVarRegister.stackPtr,
-                    )); // a = stack[sp]
+                    // A = pop()
+                    try self.emitPop();
+                    try self.emit(Armv8a.ldrRegScaled(
+                        VarReg.tempA,
+                        ArgReg.stackAddr,
+                        VarReg.stackPtr,
+                    ));
 
-                    self.emitPop();
+                    // B = pop()
+                    try self.emitPop();
+                    try self.emit(Armv8a.ldrRegScaled(
+                        VarReg.tempB,
+                        ArgReg.stackAddr,
+                        VarReg.stackPtr,
+                    ));
 
-                    self.emit(Armv8a.mult8(
-                        JitVarRegister.tempB,
-                        JitVarRegister.stackPtr,
-                    )); // b = sp;
+                    try self.emit(Armv8a.addRegs(
+                        VarReg.tempA,
+                        VarReg.tempA,
+                        VarReg.tempB,
+                    )); // a = a + b
 
-                    self.emit(Armv8a.ldrRegScaled(
-                        JitVarRegister.tempC,
-                        JitArgRegister.stackAddr,
-                        JitVarRegister.tempB,
-                    )); // c = stack[b]
-
-                    self.emit(Armv8a.addRegs(
-                        JitVarRegister.tempA,
-                        JitVarRegister.tempA,
-                        JitVarRegister.tempC,
-                    )); // a = a + c
-
-                    self.emit(Armv8a.strReg(
-                        JitVarRegister.tempA,
-                        JitArgRegister.stackAddr,
-                        JitVarRegister.tempB,
-                    )); // stack[sp] = a
+                    try self.emitPushReg(VarReg.tempA);
                 },
-                else => std.debug.panic("Not implemented\n", .{}),
+                else => try self.emitReturn(),
             }
         }
+
+        try self.emitReturn();
+        return self.getCompiledFunction();
     }
 };
+
+test "JITCompiler" {
+    const allocator = std.testing.allocator;
+    const program = [_]CodeBlock{.{
+        .constants = &[_]i64{0},
+        .instructions = &[_]u8{ Op(.add), Op(.exit) },
+    }};
+
+    var interpreter = try Interpreter.init(allocator, &program);
+    defer {
+        interpreter.deinit();
+        allocator.destroy(interpreter);
+    }
+
+    const compiled = try interpreter.jit_compiler.compileBlock(&program[0]);
+
+    var stack = [_]i64{ 2, 3 };
+    var s_ptr: usize = 2;
+    var i_ptr: usize = 0;
+    var instructions = program[0].instructions;
+    const blocks = &program;
+    const current_block: *const CodeBlock = &program[0];
+
+    compiled.func(
+        (&stack).ptr,
+        (&instructions).ptr,
+        &s_ptr,
+        &i_ptr,
+        blocks.ptr,
+        current_block,
+    );
+
+    try std.testing.expectEqual(1, s_ptr);
+    try std.testing.expectEqual(5, stack[s_ptr - 1]);
+}
 
 const Interpreter = struct {
     stack: [32_000]i64 = undefined,
