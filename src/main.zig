@@ -21,9 +21,84 @@ const CodeBlock = struct {
 };
 
 const Armv8a = struct {
-    const Ret: u32 = 0xd65f03c0;
-    const Mov42X0: u32 = 0xd2800540;
+    pub const ret: u32 = 0xd65f03c0;
+
+    // GPRs in AArch64
+    const Reg = enum(u32) { x0 = 0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12 };
+
+    // TOOD: accept registers and then cast them to u32s.
+
+    pub inline fn ldrReg(dst_reg: Reg, src_reg: Reg) u32 {
+        const dst = @intFromEnum(dst_reg);
+        const src = @intFromEnum(src_reg);
+        return (0x3E5000 << 10) | (src << 5) | dst;
+    }
+
+    pub inline fn ldrRegScaled(dst_reg: Reg, base_reg: Reg, offset_reg: Reg) u32 {
+        const dst = @intFromEnum(dst_reg);
+        const base = @intFromEnum(base_reg);
+        const offset = @intFromEnum(offset_reg);
+        return 0xF8607800 | (offset << 16) | (base << 5) | dst;
+    }
+
+    pub inline fn ldrRegUnscaled(dst_reg: Reg, base_reg: Reg, offset_reg: Reg) u32 {
+        const dst: u32 = @intFromEnum(dst_reg);
+        const base: u32 = @intFromEnum(base_reg);
+        const off: u32 = @intFromEnum(offset_reg);
+        return 0xF8606800 | (off << 16) | (base << 5) | dst;
+    }
+
+    pub inline fn subRegImm(dst_reg: Reg, src_reg: Reg, imm: u32) u32 {
+        std.debug.assert(imm <= 0b111111_111111);
+        const src: u32 = @intFromEnum(src_reg);
+        const dst: u32 = @intFromEnum(dst_reg);
+
+        return 0xD1000000 | (imm << 10) | (src << 5) | dst;
+    }
+
+    pub inline fn addRegImm(dst_reg: Reg, src_reg: Reg, imm: u32) u32 {
+        const dst = @intFromEnum(dst_reg);
+        const src = @intFromEnum(src_reg);
+        std.debug.assert(imm <= 0b111111_111111);
+        return 0x91000400 | (imm << 10) | (src << 5) | dst;
+    }
+
+    pub inline fn strReg(dst_reg: Reg, src_reg: Reg, offset: u32) u32 {
+        const dst = @intFromEnum(dst_reg);
+        const src = @intFromEnum(src_reg);
+        std.debug.assert(offset <= 0b111111_111111);
+        return 0xF9000000 | (offset << 10) | (src << 5) | dst;
+    }
+
+    pub inline fn mult8(dst_reg: Reg, src_reg: Reg) u32 {
+        const dst = @intFromEnum(dst_reg);
+        const src = @intFromEnum(src_reg);
+
+        return 0xD37DF000 | (src << 5) | dst;
+    }
 };
+
+test "ARMv8a code generation" {
+    const ldr_x8_x2 = Armv8a.ldrReg(.x8, .x2);
+    try std.testing.expectEqual(0xf9400048, ldr_x8_x2);
+
+    // ldr x9, [x0, x8, lsl #3]
+    const ldr_scaled_offset = Armv8a.ldrRegScaled(.x9, .x0, .x8);
+    try std.testing.expectEqual(0xf8687809, ldr_scaled_offset);
+
+    //	ldr x11, [x0, x10]
+    const ldr_unscaled_offset = Armv8a.ldrRegUnscaled(.x11, .x0, .x10);
+    try std.testing.expectEqual(0xf86a680b, ldr_unscaled_offset);
+
+    // add x12, x12, #1
+    try std.testing.expectEqual(0x9100058c, Armv8a.addRegImm(.x12, .x12, 1));
+    // sub x8, x8, #1
+    try std.testing.expectEqual(0xd1000508, Armv8a.subRegImm(.x8, .x8, 1));
+    // str x8, [x2]
+    try std.testing.expectEqual(0xf9000048, Armv8a.strReg(.x8, .x2, 0));
+    // lsl x10, x8, #3
+    try std.testing.expectEqual(0xd37df10a, Armv8a.mult8(.x10, .x8));
+}
 
 const IntFn = *fn () callconv(.C) u32;
 
@@ -76,7 +151,6 @@ const JITCompiler = struct {
         defer deallocJitBuf(jitbuf, 2);
 
         pthread.pthread_jit_write_protect_np(0);
-        jitbuf[0] = Armv8a.Mov42X0;
         jitbuf[1] = Armv8a.Ret;
         pthread.pthread_jit_write_protect_np(1);
 
@@ -92,19 +166,6 @@ const JITCompiler = struct {
         //         else => std.debug.panic("Not implemented\n", .{}),
         //     }
         // }
-    }
-
-    // X0 = pointer to the stack (*i64)
-    // X1 = pointer to the stack_pos (*u64)
-    // X2 = pointer to the instructions (*u8)
-    // X3 = pointer to the constants (*i64)
-    // X4 = pointer to the pc (*usize)
-    fn compileLoadConst(self: *JITCompiler) void {
-        _ = self;
-    }
-
-    fn compilePush(self: *JITCompiler) void {
-        _ = self;
     }
 };
 
@@ -211,6 +272,9 @@ const Interpreter = struct {
 
     fn jump(self: *Interpreter) void {
         const block_idx = self.nextOp();
+
+        // if the block is compiled, call compiledBlock().
+
         self.current_block = &self.blocks[block_idx];
         self.pc = 0;
     }
