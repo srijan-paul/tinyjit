@@ -63,6 +63,14 @@ const Armv8a = struct {
         return 0x91000400 | (imm << 10) | (src << 5) | dst;
     }
 
+    pub inline fn addRegs(dst_reg: Reg, reg_a: Reg, reg_b: Reg) u32 {
+        const a = @intFromEnum(reg_a);
+        const b = @intFromEnum(reg_b);
+        const dst = @intFromEnum(dst_reg);
+
+        return 0x8b000000 | (b << 16) | (a << 5) | dst;
+    }
+
     pub inline fn strReg(dst_reg: Reg, src_reg: Reg, offset: u32) u32 {
         const dst = @intFromEnum(dst_reg);
         const src = @intFromEnum(src_reg);
@@ -81,15 +89,12 @@ const Armv8a = struct {
 test "ARMv8a code generation" {
     const ldr_x8_x2 = Armv8a.ldrReg(.x8, .x2);
     try std.testing.expectEqual(0xf9400048, ldr_x8_x2);
-
     // ldr x9, [x0, x8, lsl #3]
     const ldr_scaled_offset = Armv8a.ldrRegScaled(.x9, .x0, .x8);
     try std.testing.expectEqual(0xf8687809, ldr_scaled_offset);
-
     //	ldr x11, [x0, x10]
     const ldr_unscaled_offset = Armv8a.ldrRegUnscaled(.x11, .x0, .x10);
     try std.testing.expectEqual(0xf86a680b, ldr_unscaled_offset);
-
     // add x12, x12, #1
     try std.testing.expectEqual(0x9100058c, Armv8a.addRegImm(.x12, .x12, 1));
     // sub x8, x8, #1
@@ -98,33 +103,79 @@ test "ARMv8a code generation" {
     try std.testing.expectEqual(0xf9000048, Armv8a.strReg(.x8, .x2, 0));
     // lsl x10, x8, #3
     try std.testing.expectEqual(0xd37df10a, Armv8a.mult8(.x10, .x8));
+    // add x9, x11, x9
+    try std.testing.expectEqual(0x8b090169, Armv8a.addRegs(.x9, .x11, .x9));
 }
 
-const IntFn = *fn () callconv(.C) u32;
+const JitFunction = *fn (
+    stack: *i64,
+    instructions: *u8,
+    stackPtr: *usize,
+    instrPtr: *usize,
+    blocks: [*]const CodeBlock,
+    currentBlock: *const CodeBlock,
+) callconv(.C) u32;
+
+const CompiledFunction = struct {
+    func: JitFunction,
+    buf: [*]u32,
+    size: usize,
+
+    pub fn init(func: JitFunction, buf: [*]u32, size: usize) CompiledFunction {
+        return .{ .func = func, .buf = buf, .size = size };
+    }
+
+    pub fn deinit(self: *CompiledFunction) void {
+        if (mman.munmap(self.buf, self.size) != 0) {
+            std.debug.panic("munmap failed\n", .{});
+        }
+    }
+
+    pub inline fn call(self: *CompiledFunction) void {
+        self.func();
+    }
+};
 
 const JITCompiler = struct {
     allocator: std.mem.Allocator,
 
     interpreter: *const Interpreter,
-    codeBuf: std.ArrayList(u32),
+    machine_code: std.ArrayList(u32),
     current_block: *const CodeBlock = undefined,
+
+    const JitArgRegister = struct {
+        const stackAddr = .x0;
+        const instructionsAddr = .x1;
+        const stackPtr = .x2;
+        const instrPtr = .x3;
+        const blocks = .x4;
+        const currentBlock = .x5;
+    };
+
+    const JitVarRegister = struct {
+        const stackPtr = .x8;
+        const instrPtr = .x12;
+        const tempA = .x9;
+        const tempB = .x10;
+        const tempC = .x11;
+    };
 
     pub fn init(allocator: std.mem.Allocator, interpreter: *Interpreter) JITCompiler {
         return .{
             .allocator = allocator,
             .interpreter = interpreter,
-            .codeBuf = std.ArrayList(u32).init(allocator),
+            .machine_code = std.ArrayList(u32).init(allocator),
         };
     }
 
     pub fn deinit(self: *JITCompiler) void {
-        self.codeBuf.deinit();
+        self.machine_code.deinit();
     }
 
-    fn allocJitBuf(size: usize) [*]u32 {
+    fn allocJitBuf(nbytes: usize) [*]u32 {
         const buf: *anyopaque = mman.mmap(
             null,
-            size,
+            nbytes,
             mman.PROT_WRITE | mman.PROT_EXEC,
             mman.MAP_PRIVATE | mman.MAP_ANONYMOUS | mman.MAP_JIT,
             -1,
@@ -144,28 +195,88 @@ const JITCompiler = struct {
         }
     }
 
+    /// Take all the machine code instructions emitted so far,
+    /// compile them into a function, then return the function.
+    fn getCompiledFunction(self: *JITCompiler) CompiledFunction {
+        const num_instructions = self.machine_code.items.len;
+        const bufsize = num_instructions * @sizeOf(u32);
+        const buf = allocJitBuf(bufsize);
+        defer deallocJitBuf(buf, bufsize);
+
+        pthread.pthread_jit_write_protect_np(0);
+        @memcpy(buf, self.machine_code.items);
+        pthread.pthread_jit_write_protect_np(1);
+
+        const func: JitFunction = @ptrCast(buf);
+
+        return CompiledFunction.init(func, buf, bufsize);
+    }
+
+    fn emit(self: *JITCompiler, instr: u32) void {
+        self.machine_code.append(instr);
+    }
+
+    fn emitPrelude(self: *JITCompiler) void {
+        // deref the stack pointer, store it in a local var
+        self.emit(Armv8a.ldrReg(JitVarRegister.stackPtr, JitArgRegister.stackPtr));
+        // deref the instruction pointer, store it in a local var
+        self.emit(Armv8a.ldrReg(JitVarRegister.instrPtr, JitArgRegister.instrPtr));
+    }
+
+    fn emitPop(self: *JITCompiler) void {
+        self.emit(Armv8a.subRegImm(
+            JitVarRegister.stackPtr,
+            JitVarRegister.stackPtr,
+            1,
+        ));
+    }
+
     pub fn compileBlock(self: *JITCompiler, block: *const CodeBlock) void {
         self.current_block = block;
 
-        var jitbuf = allocJitBuf(2);
-        defer deallocJitBuf(jitbuf, 2);
+        for (block.instructions) |instruction| {
+            const op: Opcode = @enumFromInt(instruction);
 
-        pthread.pthread_jit_write_protect_np(0);
-        jitbuf[1] = Armv8a.Ret;
-        pthread.pthread_jit_write_protect_np(1);
+            // ip += 1; // TODO: increment instr pointer just once.
+            self.emit(Armv8a.addRegImm(JitArgRegister.instrPtr, 1));
 
-        const func: IntFn = @ptrCast(jitbuf);
-        const ec = func();
+            switch (op) {
+                .push => {},
+                .add => {
+                    self.emit(Armv8a.ldrRegScaled(
+                        JitVarRegister.tempA,
+                        JitArgRegister.stackAddr,
+                        JitVarRegister.stackPtr,
+                    )); // a = stack[sp]
 
-        std.process.exit(@truncate(ec));
+                    self.emitPop();
 
-        // for (block.instructions) |instr| {
-        //     const op: Opcode = @enumFromInt(instr);
-        //     switch (op) {
-        //         .push => self.compilePush(),
-        //         else => std.debug.panic("Not implemented\n", .{}),
-        //     }
-        // }
+                    self.emit(Armv8a.mult8(
+                        JitVarRegister.tempB,
+                        JitVarRegister.stackPtr,
+                    )); // b = sp;
+
+                    self.emit(Armv8a.ldrRegScaled(
+                        JitVarRegister.tempC,
+                        JitArgRegister.stackAddr,
+                        JitVarRegister.tempB,
+                    )); // c = stack[b]
+
+                    self.emit(Armv8a.addRegs(
+                        JitVarRegister.tempA,
+                        JitVarRegister.tempA,
+                        JitVarRegister.tempC,
+                    )); // a = a + c
+
+                    self.emit(Armv8a.strReg(
+                        JitVarRegister.tempA,
+                        JitArgRegister.stackAddr,
+                        JitVarRegister.tempB,
+                    )); // stack[sp] = a
+                },
+                else => std.debug.panic("Not implemented\n", .{}),
+            }
+        }
     }
 };
 
