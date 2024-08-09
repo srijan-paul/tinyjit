@@ -7,9 +7,8 @@ const Opcode = enum(u8) {
     push,
     add,
     print,
-    exit,
     eq,
-    jumpif_1,
+    jump_nz,
     jump,
     load_var,
     store_var,
@@ -100,6 +99,32 @@ const Armv8a = struct {
 
         return 0x38606800 | (offset << 16) | (base << 5) | dst;
     }
+
+    pub inline fn cmpRegs(a_reg: Reg, b_reg: Reg) u32 {
+        const a = @intFromEnum(a_reg);
+        const b = @intFromEnum(b_reg);
+        return 0xEB00001F | (b << 16) | (a << 5);
+    }
+
+    /// Same as the `cset [reg] eq` instruction in ARM
+    pub inline fn setIfStatusEq(dst_reg: Reg) u32 {
+        const dst = @intFromEnum(dst_reg);
+        return 0x9A9F17E0 | dst;
+    }
+
+    pub inline fn mov1inReg(dst_reg: Reg) u32 {
+        const dst = @intFromEnum(dst_reg);
+        return 0xD2800020 | dst;
+    }
+
+    pub inline fn cmpImmediate(reg: Reg, value: u32) u32 {
+        const r = @intFromEnum(reg);
+        return 0xF100001F | (value << 10) | (r << 5);
+    }
+
+    pub inline fn branchIfEq(branch_offset: u32) u32 {
+        return 0x54000000 | (branch_offset << 5);
+    }
 };
 
 test "ARMv8a code generation" {
@@ -125,6 +150,16 @@ test "ARMv8a code generation" {
     try std.testing.expectEqual(0xf82a7928, Armv8a.strRegScaled(.x8, .x9, .x10));
     // ldrb w8, [x1, x8]
     try std.testing.expectEqual(0x38686828, Armv8a.ldrByteReg(.x8, .x1, .x8));
+    // cmp x1, x2
+    try std.testing.expectEqual(0xeb02003f, Armv8a.cmpRegs(.x1, .x2));
+    // cset x3, eq
+    try std.testing.expectEqual(0x9A9F17E3, Armv8a.setIfStatusEq(.x3));
+    // mov x1, 1
+    try std.testing.expectEqual(0xd2800021, Armv8a.mov1inReg(.x1));
+    try std.testing.expectEqual(0xf100043f, Armv8a.cmpImmediate(.x1, 1));
+
+    // b.eq (ip + 2)
+    try std.testing.expectEqual(0x54000040, Armv8a.branchIfEq(2));
 }
 
 const JitFunction = *fn (
@@ -145,7 +180,7 @@ const CompiledFunction = struct {
         return .{ .func = func, .buf = buf, .size = size };
     }
 
-    pub fn deinit(self: *CompiledFunction) void {
+    pub fn deinit(self: *const CompiledFunction) void {
         if (mman.munmap(self.buf, self.size) != 0) {
             std.debug.panic("munmap failed\n", .{});
         }
@@ -157,7 +192,6 @@ const JITCompiler = struct {
 
     interpreter: *const Interpreter,
     machine_code: std.ArrayList(u32),
-    current_block: *const CodeBlock = undefined,
 
     const ArgReg = struct {
         const stackAddr = .x0;
@@ -184,7 +218,7 @@ const JITCompiler = struct {
         };
     }
 
-    pub fn deinit(self: *JITCompiler) void {
+    pub fn deinit(self: *const JITCompiler) void {
         self.machine_code.deinit();
     }
 
@@ -288,9 +322,15 @@ const JITCompiler = struct {
         try self.emitAdvanceIp();
     }
 
-    pub fn compileBlock(self: *JITCompiler, block: *const CodeBlock) !CompiledFunction {
-        self.current_block = block;
+    inline fn readStackTop(self: *JITCompiler, dst_reg: Armv8a.Reg) !void {
+        try self.emit(Armv8a.ldrRegScaled(
+            dst_reg,
+            ArgReg.stackAddr,
+            VarReg.stackIndex,
+        ));
+    }
 
+    pub fn compileBlock(self: *JITCompiler, block: *const CodeBlock) !CompiledFunction {
         try self.emitPrelude();
 
         var i: usize = 0;
@@ -313,12 +353,24 @@ const JITCompiler = struct {
                     try self.readInstruction(VarReg.tempA);
                     i += 1;
 
-                    try self.emit(Armv8a.ldrByteReg(
+                    try self.emit(Armv8a.ldrRegScaled(
                         VarReg.tempB,
                         ArgReg.stackAddr,
                         VarReg.tempA,
                     )); // b = stack[a]
                     try self.emitPushReg(VarReg.tempB); // push(stack[a]);
+                },
+
+                .eq => {
+                    try self.emitPop();
+                    try self.readStackTop(VarReg.tempA);
+
+                    try self.emitPop();
+                    try self.readStackTop(VarReg.tempB);
+
+                    try self.emit(Armv8a.cmpRegs(VarReg.tempA, VarReg.tempB));
+                    try self.emit(Armv8a.setIfStatusEq(VarReg.tempC));
+                    try self.emitPushReg(VarReg.tempC);
                 },
 
                 .store_var => {
@@ -366,22 +418,42 @@ const JITCompiler = struct {
                     try self.emitReturn();
                 },
 
+                .jump_nz => {
+                    // a = pop();
+                    try self.emitPop();
+                    try self.readStackTop(VarReg.tempA);
+
+                    const dst_block = VarReg.tempB;
+
+                    // block_index = instructions[ip]; ip++;
+                    try self.readInstruction(dst_block);
+                    i += 1;
+
+                    // if (a == 0)
+                    try self.emit(Armv8a.cmpImmediate(VarReg.tempA, 0));
+                    try self.emit(Armv8a.setIfStatusEq(VarReg.tempC));
+
+                    try self.emit(0); // dummy instr, this will be patched below
+                    const jmp_instr_index = self.machine_code.items.len - 1;
+
+                    // current_block = block_index;
+                    try self.emit(Armv8a.strReg(dst_block, ArgReg.currentBlockNumber, 0));
+                    try self.emitReturn();
+
+                    // patch the dummy jump instruction we emitted above
+                    const offset = self.machine_code.items.len - jmp_instr_index;
+                    self.machine_code.items[jmp_instr_index] =
+                        Armv8a.branchIfEq(@intCast(offset));
+                },
+
                 .add => {
                     // A = pop()
                     try self.emitPop();
-                    try self.emit(Armv8a.ldrRegScaled(
-                        VarReg.tempA,
-                        ArgReg.stackAddr,
-                        VarReg.stackIndex,
-                    ));
+                    try self.readStackTop(VarReg.tempA);
 
                     // B = pop()
                     try self.emitPop();
-                    try self.emit(Armv8a.ldrRegScaled(
-                        VarReg.tempB,
-                        ArgReg.stackAddr,
-                        VarReg.stackIndex,
-                    ));
+                    try self.readStackTop(VarReg.tempB);
 
                     try self.emit(Armv8a.addRegs(
                         VarReg.tempA,
@@ -391,7 +463,10 @@ const JITCompiler = struct {
 
                     try self.emitPushReg(VarReg.tempA);
                 },
-                else => try self.emitReturn(),
+                else => std.debug.panic(
+                    "JIT is not supported for instruction {s}\n",
+                    .{@tagName(op)},
+                ),
             }
         }
 
@@ -414,7 +489,29 @@ test "JITCompiler" {
             1,
             Op(.store_var),
             0,
-            Op(.jump),
+
+            Op(.push),
+            1,
+            Op(.push),
+            0,
+            Op(.eq),
+
+            Op(.jump_nz),
+            33,
+
+            Op(.push),
+            1,
+            Op(.push),
+            0,
+            Op(.eq),
+
+            Op(.push),
+            1,
+            Op(.push),
+            1,
+            Op(.eq),
+
+            Op(.jump_nz),
             22,
         },
     }};
@@ -442,9 +539,9 @@ test "JITCompiler" {
         program[0].constants.ptr,
     );
 
-    try std.testing.expectEqual(3, s_ptr);
+    try std.testing.expectEqual(4, s_ptr);
     try std.testing.expectEqual(instructions.len, i_ptr);
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 12, 30, 5 }, stack[0..3]);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 12, 30, 5, 0 }, stack[0..s_ptr]);
     try std.testing.expectEqual(22, current_block_index);
 }
 
@@ -452,12 +549,16 @@ const Interpreter = struct {
     stack: [32_000]i64 = undefined,
     stack_pos: u64 = 0,
 
+    allocator: std.mem.Allocator,
+
     blocks: []const CodeBlock,
+    jit_blocks: []?CompiledFunction,
+
     current_block: *const CodeBlock = undefined,
+    pc: usize = 0,
 
     jit_compiler: JITCompiler,
-
-    pc: usize = 0,
+    is_jit_enabled: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, blocks: []const CodeBlock) !*Interpreter {
         const self = try allocator.create(Interpreter);
@@ -465,13 +566,28 @@ const Interpreter = struct {
             .blocks = blocks,
             .current_block = &blocks[0],
             .jit_compiler = JITCompiler.init(allocator, self),
+            .jit_blocks = try allocator.alloc(?CompiledFunction, blocks.len),
+            .allocator = allocator,
         };
+
+        for (self.jit_blocks) |*jit_block| {
+            jit_block.* = null;
+        }
 
         return self;
     }
 
-    fn deinit(self: *Interpreter) void {
+    fn deinit(self: *const Interpreter) void {
         self.jit_compiler.deinit();
+
+        // unmap all the JIT functions
+        for (self.jit_blocks) |maybe_jit_block| {
+            if (maybe_jit_block) |*jit_block| {
+                jit_block.deinit();
+            }
+        }
+
+        self.allocator.free(self.jit_blocks);
     }
 
     inline fn loadConst(self: *Interpreter) i64 {
@@ -503,8 +619,6 @@ const Interpreter = struct {
     }
 
     pub fn run(self: *Interpreter) !void {
-        self.jit_compiler.compileBlock(&self.blocks[1]);
-
         while (self.pc < self.current_block.instructions.len) {
             const instr: Opcode = @enumFromInt(self.nextOp());
 
@@ -516,20 +630,16 @@ const Interpreter = struct {
                     self.push(a + b);
                 },
                 .print => std.debug.print("{d}\n", .{self.pop()}),
-                .exit => {
-                    const exit_code: u8 = @intCast(self.pop());
-                    std.process.exit(exit_code);
-                },
                 .eq => {
                     const a = self.pop();
                     const b = self.pop();
                     self.push(if (a == b) 1 else 0);
                 },
 
-                .jump => self.jump(),
-                .jumpif_1 => {
-                    if (self.pop() == 1) {
-                        self.jump();
+                .jump => try self.jump(),
+                .jump_nz => {
+                    if (self.pop() != 0) {
+                        try self.jump();
                     } else {
                         self.pc += 1;
                     }
@@ -549,13 +659,55 @@ const Interpreter = struct {
         }
     }
 
-    fn jump(self: *Interpreter) void {
-        const block_idx = self.nextOp();
+    inline fn callJit(self: *Interpreter, compiled: *const CompiledFunction) void {
+        var next_block_idx: usize = 0;
+        compiled.func(
+            (&self.stack).ptr,
+            self.current_block.instructions.ptr,
+            &self.stack_pos,
+            &self.pc,
+            &next_block_idx,
+            self.current_block.constants.ptr,
+        );
 
-        // if the block is compiled, call compiledBlock().
-
-        self.current_block = &self.blocks[block_idx];
+        self.current_block = &self.blocks[next_block_idx];
         self.pc = 0;
+    }
+
+    fn doJit(self: *Interpreter, block_index: usize) !void {
+        const block = &self.blocks[block_index];
+        const compiled = try self.jit_compiler.compileBlock(block);
+
+        self.jit_blocks[block_index] = compiled;
+        self.callJit(&compiled);
+    }
+
+    fn jump(self: *Interpreter) !void {
+        // block index is the next "instruction".
+        const block_idx = self.nextOp();
+        self.pc = 0; // start from first instr in the next block
+        const dst_block = &self.blocks[block_idx];
+
+        if (!self.is_jit_enabled) {
+            self.current_block = dst_block;
+            return;
+        }
+
+        // check if the block has been JIT compiled before.
+        if (self.jit_blocks[block_idx]) |*compiled| {
+            self.callJit(compiled);
+            return;
+        }
+
+        if (self.current_block == dst_block) {
+            // self-referencing block. potentially a loop.
+            // JIT compile this.
+            try self.doJit(block_idx);
+            return;
+        }
+
+        // Not a self-referencing block, so do regular execution.
+        self.current_block = dst_block;
     }
 };
 
@@ -584,7 +736,7 @@ pub fn main() !void {
             Op(.load_var), 1, // load i
             Op(.push), 0, // load 1_000_000
             Op(.eq),
-            Op(.jumpif_1), 2, // jump to exit if i == 1_000_000
+            Op(.jump_nz), 2, // jump to exit if i == 1_000_000
 
             // x = x + 1
             Op(.load_var), 0, // load x
@@ -599,15 +751,13 @@ pub fn main() !void {
             Op(.store_var), 1, // i = i + 1
             Op(.jump), 1, // jump to start
         },
-        .constants = &[_]i64{ 1_00_0001, 1 },
+        .constants = &[_]i64{ 5, 1 },
     };
 
     const b2 = CodeBlock{
         .instructions = &[_]u8{
             Op(.load_var), 0, // load x
             Op(.print),
-            Op(.push), 0, // load 0
-            Op(.exit),
         },
         .constants = &[_]i64{0},
     };
@@ -615,6 +765,7 @@ pub fn main() !void {
     const program = [_]CodeBlock{ b0, b1, b2 };
 
     var interpreter = try Interpreter.init(allocator, &program);
+    interpreter.is_jit_enabled = true;
     defer {
         interpreter.deinit();
         allocator.destroy(interpreter);
