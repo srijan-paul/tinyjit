@@ -132,8 +132,7 @@ const JitFunction = *fn (
     instructions: [*]const u8, // x1
     stack_ptr: *usize, // x2
     instr_ptr: *usize, // x3
-    blocks: [*]const CodeBlock, // x4
-    current_block: *const CodeBlock, // x5
+    current_block_index: *usize, // x5
     constants: [*]const i64, // x6
 ) callconv(.C) void;
 
@@ -165,9 +164,8 @@ const JITCompiler = struct {
         const instructionsAddr = .x1;
         const stackIndexPtr = .x2;
         const instrIndexPtr = .x3;
-        const blocks = .x4;
-        const currentBlock = .x5;
-        const constantsAddr = .x6;
+        const currentBlockNumber = .x4;
+        const constantsAddr = .x5;
     };
 
     const VarReg = struct {
@@ -355,6 +353,19 @@ const JITCompiler = struct {
 
                     try self.emitPushReg(VarReg.tempB); // push(p)
                 },
+
+                .jump => {
+                    try self.readInstruction(VarReg.tempA);
+                    i += 1;
+
+                    try self.emit(Armv8a.strReg(
+                        VarReg.tempA,
+                        ArgReg.currentBlockNumber,
+                        0,
+                    ));
+                    try self.emitReturn();
+                },
+
                 .add => {
                     // A = pop()
                     try self.emitPop();
@@ -403,7 +414,8 @@ test "JITCompiler" {
             1,
             Op(.store_var),
             0,
-            Op(.exit),
+            Op(.jump),
+            22,
         },
     }};
 
@@ -419,22 +431,21 @@ test "JITCompiler" {
     var s_ptr: usize = 2;
     var i_ptr: usize = 0;
     var instructions = program[0].instructions;
-    const blocks = &program;
-    const current_block: *const CodeBlock = &program[0];
+    var current_block_index: usize = 0;
 
     compiled.func(
         (&stack).ptr,
         (&instructions).ptr,
         &s_ptr,
         &i_ptr,
-        blocks.ptr,
-        current_block,
+        &current_block_index,
         program[0].constants.ptr,
     );
 
     try std.testing.expectEqual(3, s_ptr);
     try std.testing.expectEqual(instructions.len, i_ptr);
     try std.testing.expectEqualSlices(i64, &[_]i64{ 12, 30, 5 }, stack[0..3]);
+    try std.testing.expectEqual(22, current_block_index);
 }
 
 const Interpreter = struct {
