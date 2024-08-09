@@ -92,6 +92,14 @@ const Armv8a = struct {
 
         return 0xD37DF000 | (src << 5) | dst;
     }
+
+    pub inline fn ldrByteReg(dst_reg: Reg, base_reg: Reg, offset_reg: Reg) u32 {
+        const dst = @intFromEnum(dst_reg);
+        const base = @intFromEnum(base_reg);
+        const offset = @intFromEnum(offset_reg);
+
+        return 0x38606800 | (offset << 16) | (base << 5) | dst;
+    }
 };
 
 test "ARMv8a code generation" {
@@ -115,15 +123,18 @@ test "ARMv8a code generation" {
     try std.testing.expectEqual(0x8b090169, Armv8a.addRegs(.x9, .x11, .x9));
     // str x8, [x9, x10, lsl #3]
     try std.testing.expectEqual(0xf82a7928, Armv8a.strRegScaled(.x8, .x9, .x10));
+    // ldrb w8, [x1, x8]
+    try std.testing.expectEqual(0x38686828, Armv8a.ldrByteReg(.x8, .x1, .x8));
 }
 
 const JitFunction = *fn (
-    stack: [*]i64,
-    instructions: [*]const u8,
-    stack_ptr: *usize,
-    instr_ptr: *usize,
-    blocks: [*]const CodeBlock,
-    current_block: *const CodeBlock,
+    stack: [*]i64, // x0
+    instructions: [*]const u8, // x1
+    stack_ptr: *usize, // x2
+    instr_ptr: *usize, // x3
+    blocks: [*]const CodeBlock, // x4
+    current_block: *const CodeBlock, // x5
+    constants: [*]const i64, // x6
 ) callconv(.C) void;
 
 const CompiledFunction = struct {
@@ -152,15 +163,16 @@ const JITCompiler = struct {
     const ArgReg = struct {
         const stackAddr = .x0;
         const instructionsAddr = .x1;
-        const stackPtr = .x2;
-        const instrPtr = .x3;
+        const stackIndexPtr = .x2;
+        const instrIndexPtr = .x3;
         const blocks = .x4;
         const currentBlock = .x5;
+        const constantsAddr = .x6;
     };
 
     const VarReg = struct {
-        const stackPtr = .x8;
-        const instrPtr = .x12;
+        const stackIndex = .x8;
+        const instrIndex = .x12;
         const tempA = .x9;
         const tempB = .x10;
         const tempC = .x11;
@@ -222,21 +234,21 @@ const JITCompiler = struct {
 
     fn emitPrelude(self: *JITCompiler) !void {
         // deref the stack pointer, store it in a local var
-        try self.emit(Armv8a.ldrReg(VarReg.stackPtr, ArgReg.stackPtr));
+        try self.emit(Armv8a.ldrReg(VarReg.stackIndex, ArgReg.stackIndexPtr));
         // deref the instruction pointer, store it in a local var
-        try self.emit(Armv8a.ldrReg(VarReg.instrPtr, ArgReg.instrPtr));
+        try self.emit(Armv8a.ldrReg(VarReg.instrIndex, ArgReg.instrIndexPtr));
     }
 
     fn emitEpilogue(self: *JITCompiler) !void {
         // Restore the stack and instruction pointers
-        try self.emit(Armv8a.strReg(VarReg.stackPtr, ArgReg.stackPtr, 0));
-        try self.emit(Armv8a.strReg(VarReg.instrPtr, ArgReg.instrPtr, 0));
+        try self.emit(Armv8a.strReg(VarReg.stackIndex, ArgReg.stackIndexPtr, 0));
+        try self.emit(Armv8a.strReg(VarReg.instrIndex, ArgReg.instrIndexPtr, 0));
     }
 
     fn emitPop(self: *JITCompiler) !void {
         try self.emit(Armv8a.subRegImm(
-            VarReg.stackPtr,
-            VarReg.stackPtr,
+            VarReg.stackIndex,
+            VarReg.stackIndex,
             1,
         ));
     }
@@ -245,17 +257,17 @@ const JITCompiler = struct {
         try self.emit(Armv8a.strRegScaled(
             reg,
             ArgReg.stackAddr,
-            VarReg.stackPtr,
+            VarReg.stackIndex,
         ));
 
         try self.emit(Armv8a.addRegImm(
-            VarReg.stackPtr,
-            VarReg.stackPtr,
+            VarReg.stackIndex,
+            VarReg.stackIndex,
             1,
         ));
     }
 
-    fn emitReturn(self: *JITCompiler) !void {
+    inline fn emitReturn(self: *JITCompiler) !void {
         try self.emitEpilogue();
         try self.emit(Armv8a.ret);
     }
@@ -264,25 +276,57 @@ const JITCompiler = struct {
         self.current_block = block;
 
         try self.emitPrelude();
-        for (block.instructions) |instruction| {
+
+        var i: usize = 0;
+        while (i < block.instructions.len) {
+            const instruction = block.instructions[i];
             const op: Opcode = @enumFromInt(instruction);
 
-            // ip += 1; // TODO: increment instr pointer just once, for all instrs.
+            // ip += 1;
             try self.emit(Armv8a.addRegImm(
-                ArgReg.instrPtr,
-                ArgReg.instrPtr,
+                VarReg.instrIndex,
+                VarReg.instrIndex,
                 1,
             ));
 
+            i += 1;
+
             switch (op) {
-                .push => {},
+                .push => {
+                    const constant_index = VarReg.tempA;
+
+                    // a = instructions[ip]
+                    try self.emit(Armv8a.ldrByteReg(
+                        constant_index,
+                        ArgReg.instructionsAddr,
+                        VarReg.instrIndex,
+                    ));
+
+                    // advance instruction pointer
+                    try self.emit(Armv8a.addRegImm(
+                        VarReg.instrIndex,
+                        VarReg.instrIndex,
+                        1,
+                    )); // ip++ ;
+
+                    i += 1;
+
+                    const value = VarReg.tempB;
+                    try self.emit(Armv8a.ldrRegScaled(
+                        value,
+                        ArgReg.constantsAddr,
+                        constant_index,
+                    )); // b = constants[a]
+
+                    try self.emitPushReg(value); // push(p)
+                },
                 .add => {
                     // A = pop()
                     try self.emitPop();
                     try self.emit(Armv8a.ldrRegScaled(
                         VarReg.tempA,
                         ArgReg.stackAddr,
-                        VarReg.stackPtr,
+                        VarReg.stackIndex,
                     ));
 
                     // B = pop()
@@ -290,7 +334,7 @@ const JITCompiler = struct {
                     try self.emit(Armv8a.ldrRegScaled(
                         VarReg.tempB,
                         ArgReg.stackAddr,
-                        VarReg.stackPtr,
+                        VarReg.stackIndex,
                     ));
 
                     try self.emit(Armv8a.addRegs(
@@ -313,8 +357,8 @@ const JITCompiler = struct {
 test "JITCompiler" {
     const allocator = std.testing.allocator;
     const program = [_]CodeBlock{.{
-        .constants = &[_]i64{0},
-        .instructions = &[_]u8{ Op(.add), Op(.exit) },
+        .constants = &[_]i64{30},
+        .instructions = &[_]u8{ Op(.add), Op(.push), 0, Op(.exit) },
     }};
 
     var interpreter = try Interpreter.init(allocator, &program);
@@ -339,10 +383,12 @@ test "JITCompiler" {
         &i_ptr,
         blocks.ptr,
         current_block,
+        program[0].constants.ptr,
     );
 
-    try std.testing.expectEqual(1, s_ptr);
-    try std.testing.expectEqual(5, stack[s_ptr - 1]);
+    try std.testing.expectEqual(2, s_ptr);
+    try std.testing.expectEqual(4, i_ptr);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 30 }, &stack);
 }
 
 const Interpreter = struct {
