@@ -323,6 +323,26 @@ const JITCompiler = struct {
                     try self.emitPushReg(VarReg.tempB); // push(stack[a]);
                 },
 
+                .store_var => {
+                    // a = instructions[ip]; ip++;
+                    try self.readInstruction(VarReg.tempA);
+                    i += 1;
+
+                    // b = pop();
+                    try self.emitPop();
+                    try self.emit(Armv8a.ldrRegScaled(
+                        VarReg.tempB,
+                        ArgReg.stackAddr,
+                        VarReg.stackIndex,
+                    ));
+
+                    try self.emit(Armv8a.strRegScaled(
+                        VarReg.tempB,
+                        ArgReg.stackAddr,
+                        VarReg.tempA,
+                    )); // stack[a] = b;
+                },
+
                 .push => {
                     try self.readInstruction(VarReg.tempA);
                     i += 1;
@@ -372,12 +392,16 @@ const JITCompiler = struct {
 test "JITCompiler" {
     const allocator = std.testing.allocator;
     const program = [_]CodeBlock{.{
-        .constants = &[_]i64{30},
+        .constants = &[_]i64{ 30, 12 },
         .instructions = &[_]u8{
             Op(.add),
             Op(.push), // x = 30
             0,
             Op(.load_var), // push(x)
+            0,
+            Op(.push),
+            1,
+            Op(.store_var),
             0,
             Op(.exit),
         },
@@ -409,8 +433,8 @@ test "JITCompiler" {
     );
 
     try std.testing.expectEqual(3, s_ptr);
-    try std.testing.expectEqual(6, i_ptr);
-    try std.testing.expectEqualSlices(i64, &[_]i64{ 5, 30, 5 }, stack[0..3]);
+    try std.testing.expectEqual(instructions.len, i_ptr);
+    try std.testing.expectEqualSlices(i64, &[_]i64{ 12, 30, 5 }, stack[0..3]);
 }
 
 const Interpreter = struct {
