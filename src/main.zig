@@ -60,7 +60,6 @@ pub fn main() !void {
     const b2 = CodeBlock{
         .instructions = &[_]u8{
             Op(.load_var), 0, // load x
-            // Op(.print),
         },
         .constants = &[_]i64{0},
     };

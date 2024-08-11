@@ -4,7 +4,6 @@ const jit = @import("jit.zig");
 pub const Opcode = enum(u8) {
     push,
     add,
-    print,
     eq,
     jump_nz,
     jump,
@@ -18,7 +17,9 @@ pub inline fn Op(op: Opcode) u8 {
 }
 
 pub const CodeBlock = struct {
+    /// A list of `Opcode`s cast to u8
     instructions: []const u8,
+    /// Constants used within this block
     constants: []const i64,
 };
 
@@ -106,7 +107,6 @@ pub const Interpreter = struct {
                     const b = self.pop();
                     self.push(a + b);
                 },
-                .print => std.debug.print("{d}\n", .{self.pop()}),
                 .eq => {
                     const a = self.pop();
                     const b = self.pop();

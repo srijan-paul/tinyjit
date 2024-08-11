@@ -11,7 +11,7 @@ const Op = interp.Op;
 const Armv8a = struct {
     pub const ret: u32 = 0xd65f03c0;
 
-    // GPRs in AArch64
+    // GPRs in AArch64. We only ever use 12 of them.
     const Reg = enum(u32) { x0 = 0, x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12 };
 
     pub inline fn ldrReg(dst_reg: Reg, src_reg: Reg) u32 {
@@ -421,10 +421,6 @@ pub const JITCompiler = struct {
 
                     try self.emitPushReg(VarReg.tempA);
                 },
-                else => std.debug.panic(
-                    "JIT is not supported for instruction {s}\n",
-                    .{@tagName(op)},
-                ),
             }
         }
 
