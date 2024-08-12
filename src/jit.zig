@@ -109,8 +109,10 @@ const Armv8a = struct {
         return 0xF100001F | (value << 10) | (r << 5);
     }
 
-    pub inline fn branchIfEq(branch_offset: u32) u32 {
-        return 0x54000000 | (branch_offset << 5);
+    pub inline fn branchIfEq(branch_offset: i32) u32 {
+        const mask: i32 = std.math.maxInt(u19);
+        const offset: u32 = @bitCast(branch_offset & mask);
+        return 0x54000000 | (offset << 5);
     }
 };
 
@@ -282,7 +284,7 @@ pub const JITCompiler = struct {
         ));
     }
 
-    pub fn compileBlock(self: *JITCompiler, block: *const CodeBlock) !CompiledFunction {
+    pub fn compileBlock(self: *JITCompiler, block_number: usize, block: *const CodeBlock) !CompiledFunction {
         try self.emitPrelude();
 
         var i: usize = 0;
@@ -360,19 +362,21 @@ pub const JITCompiler = struct {
 
                 .jump => {
                     try self.readInstruction(VarReg.tempA);
+                    const dst_block = block.instructions[i];
                     i += 1;
 
-                    try self.emit(Armv8a.strReg(
-                        VarReg.tempA,
-                        ArgReg.currentBlockNumber,
-                        0,
-                    ));
-
-                    // TODO: if the jump destination is the same block,
-                    // set ip to zero, and jump backwards to the start of the block.
-
-                    try self.emit(Armv8a.movRegImm(VarReg.instrIndex, 0)); // ip = 0
-                    try self.emitReturn();
+                    if (dst_block == block_number) {
+                        // we're jumping back the same block.
+                        try self.emit(Armv8a.movRegImm(VarReg.instrIndex, 0)); // reset ip
+                        const distance: i32 = @intCast(self.machine_code.items.len);
+                        try self.emit(Armv8a.branchIfEq(-distance)); // jump backwards.
+                    } else {
+                        try self.emit(
+                            Armv8a.strReg(VarReg.tempA, ArgReg.currentBlockNumber, 0),
+                        );
+                        try self.emit(Armv8a.movRegImm(VarReg.instrIndex, 0)); // ip = 0
+                        try self.emitReturn();
+                    }
                 },
 
                 .jump_nz => {
@@ -462,6 +466,8 @@ test "ARMv8a code generation" {
     try std.testing.expectEqual(0xf100043f, Armv8a.cmpImmediate(.x1, 1));
     // b.eq (ip + 2)
     try std.testing.expectEqual(0x54000040, Armv8a.branchIfEq(2));
+    // b.eq (ip - 3)
+    try std.testing.expectEqual(0x54ffffa0, Armv8a.branchIfEq(-3));
 }
 
 test "JITCompiler" {
@@ -511,7 +517,7 @@ test "JITCompiler" {
         allocator.destroy(interpreter);
     }
 
-    const compiled = try interpreter.jit_compiler.compileBlock(&program[0]);
+    const compiled = try interpreter.jit_compiler.compileBlock(0, &program[0]);
 
     var stack = [_]i64{ 2, 3, 0, 0, 0, 0, 0, 0 };
     var s_ptr: usize = 2;

@@ -86,7 +86,11 @@ pub fn main() !void {
     const dt: f64 = @floatFromInt(after - before);
     const avg_time = dt / @as(f64, @floatFromInt(n_runs));
 
-    const msg = try std.fmt.allocPrintZ(allocator, "Time per run: {d} ms\n", .{avg_time});
+    const msg = try std.fmt.allocPrintZ(
+        allocator,
+        "Time per run (JIT = {s}): {d} ms\n",
+        .{ if (is_jit_enabled) "ON" else "OFF", avg_time },
+    );
     defer allocator.free(msg);
 
     const stdout = std.io.getStdOut();

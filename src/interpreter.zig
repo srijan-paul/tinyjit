@@ -154,7 +154,7 @@ pub const Interpreter = struct {
 
     fn doJit(self: *Interpreter, block_index: usize) !void {
         const block = &self.blocks[block_index];
-        const compiled = try self.jit_compiler.compileBlock(block);
+        const compiled = try self.jit_compiler.compileBlock(block_index, block);
 
         self.jit_blocks[block_index] = compiled;
         self.callJit(&compiled);
